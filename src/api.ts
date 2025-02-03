@@ -23,7 +23,6 @@ export const app = honoApp
         const fileName = c.req.param('fileName');
         console.log('Uploading file...', fileName);
 
-
         await fileStorage.uploadFile(uploadStream, fileName, 10_000_000, 4);
 
         return c.json({ ok: true });

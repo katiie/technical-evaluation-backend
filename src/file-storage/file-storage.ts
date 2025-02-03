@@ -9,7 +9,7 @@ import { computeChecksum } from './helpers';
 export interface FileStorage {
     /**
      * Upload file should handle a web standards ReadableStream and put the file into the storage backend.
-     * 
+     *
      * Chunk size is a parameter that should be used to determine the size of "chunks" of the file to store in
      * the storagebackend.
      *
@@ -93,7 +93,6 @@ export class AppFileStorage implements FileStorage {
     public async listUploadedFiles(): Promise<string[]> {
         return this.uploadedfileKey;
     }
-
 
     private async appendBufferFromFileKey(
         key: string,
