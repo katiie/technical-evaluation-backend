@@ -73,7 +73,7 @@ export class AppFileStorage implements FileStorage {
     }
 
     public async listUploadedFiles(): Promise<string[]> {
-        return [];
+        return this.uploadedfileKey;
     }
 
 
