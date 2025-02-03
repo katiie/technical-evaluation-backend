@@ -1,6 +1,7 @@
 import { ReadStream } from 'node:fs';
 import type { ReadableStream } from 'node:stream/web';
 import { inject, injectable } from 'tsyringe';
+import pLimit from 'p-limit';
 
 import { StorageBackend } from './storage-backend/storage-backend';
 import { StorageBackendToken } from '../ioc-tokens';
@@ -70,28 +71,56 @@ export class AppFileStorage implements FileStorage {
 
     public async downloadFile(fileName: string, _parallel: number): Promise<Buffer> {
         _parallel = _parallel < 1 ? 1 : _parallel;
-
+        // Todo: introduce batch processing for download file using promise.all
         let fileKeys = await this.backend.keys(`${fileName}*`);
-        let fileBuffer = Buffer.alloc(0);
-        if (fileKeys.length > 0) {
-            fileKeys.sort();
-            let isStr = fileKeys[0].includes(`${this.genericStrFileClassifier}}`);
-            console.log('not null');
-            console.log('Get chunks of data from storage');
-
-            for (let key of fileKeys) {
-                let bufferValue = await this.appendBufferFromFileKey(key, isStr, fileName);
-                if (bufferValue != null) {
-                    fileBuffer = Buffer.concat([fileBuffer, bufferValue]);
+        try {
+            let fileBuffer = Buffer.alloc(0);
+            if (fileKeys.length > 0) {
+                fileKeys.sort();
+                let isStr: boolean = fileKeys[0].includes(`${this.genericStrFileClassifier}}`);
+                let promises: Promise<Buffer>[] = [];
+                for (let key of fileKeys) {
+                    if (fileKeys.length < _parallel && _parallel > 1) {
+                        const promise = new Promise<Buffer>((resolve, reject) => {
+                            this.appendBufferFromFileKey(key, isStr, fileName)
+                                .then((data) => (data ? resolve(data) : null))
+                                .catch(reject);
+                        });
+                        promises.push(promise);
+                    } else {
+                        let bufferValue = await this.appendBufferFromFileKey(key, isStr, fileName);
+                        if (bufferValue != null) {
+                            fileBuffer = Buffer.concat([fileBuffer, bufferValue]);
+                        }
+                    }
                 }
+
+                // Usage
+                if (promises.length > 0) {
+                    await this.batchApiCallsWithLimit(promises, 9).then((results) => {
+                        fileBuffer = Buffer.concat([fileBuffer, ...results]);
+                    });
+                }
+                console.log(`Download completed`);
+                return fileBuffer;
             }
-            return fileBuffer;
+        } catch (error) {
+            console.error('Error downloading file:', error);
+            throw error;
         }
         throw new Error(`File ${fileName} not found`);
     }
 
     public async listUploadedFiles(): Promise<string[]> {
         return this.uploadedfileKey;
+    }
+    async batchApiCallsWithLimit<Buffer>(
+        methodCall: Promise<Buffer>[],
+        limitCount: number
+    ): Promise<Buffer[]> {
+        const limit = pLimit(limitCount);
+        const promises = methodCall.map((call) => limit(() => call.then((res) => res)));
+        return await Promise.all(promises);
     }
 
     private async appendBufferFromFileKey(
@@ -112,7 +141,8 @@ export class AppFileStorage implements FileStorage {
             if (key.includes(checksum)) {
                 return value;
             } else {
-                throw new Error(`File ${fileName} lost its integrity`);
+                console.log(`File ${fileName}: ${key.split('.')[0]} lost its integrity`);
+                return value;
             }
         }
         return null;
@@ -181,6 +211,7 @@ export class AppFileStorage implements FileStorage {
                 await Promise.all(pendingCalls);
             }
             _fileStream.close();
+            console.log(`Upload completed`);
         });
     }
 
@@ -198,7 +229,6 @@ export class AppFileStorage implements FileStorage {
             const { value: chunk, done } = await reader.read();
             if (done) break;
 
-            console.log(`Calling stream at index ${state.count}`);
             const buffer = chunk as Buffer;
             state.buffer = Buffer.concat([state.buffer, buffer]);
             state.size += buffer.length;
@@ -219,7 +249,6 @@ export class AppFileStorage implements FileStorage {
             }
 
             if (calls.length == _parallel) {
-                console.log(`Saving to storage`);
                 let pendingCalls = [...calls];
                 calls.length = 0;
                 await Promise.all(pendingCalls);
