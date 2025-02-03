@@ -69,6 +69,24 @@ export class AppFileStorage implements FileStorage {
     }
 
     public async downloadFile(fileName: string, _parallel: number): Promise<Buffer> {
+        _parallel = _parallel < 1 ? 1 : _parallel;
+
+        let fileKeys = await this.backend.keys(`${fileName}*`);
+        let fileBuffer = Buffer.alloc(0);
+        if (fileKeys.length > 0) {
+            fileKeys.sort();
+            let isStr = fileKeys[0].includes(`${this.genericStrFileClassifier}}`);
+            console.log('not null');
+            console.log('Get chunks of data from storage');
+
+            for (let key of fileKeys) {
+                let bufferValue = await this.appendBufferFromFileKey(key, isStr, fileName);
+                if (bufferValue != null) {
+                    fileBuffer = Buffer.concat([fileBuffer, bufferValue]);
+                }
+            }
+            return fileBuffer;
+        }
         throw new Error(`File ${fileName} not found`);
     }
 
@@ -76,6 +94,30 @@ export class AppFileStorage implements FileStorage {
         return this.uploadedfileKey;
     }
 
+
+    private async appendBufferFromFileKey(
+        key: string,
+        isStr: boolean,
+        fileName: string
+    ): Promise<Buffer | null> {
+        if (isStr) {
+            const value = await this.backend.get(key);
+            if (value != null) {
+                return Buffer.from(value);
+            }
+        }
+
+        const value = await this.backend.getBuffer(key);
+        if (value != null) {
+            let checksum = await this.backend.verifyChecksum(key);
+            if (key.includes(checksum)) {
+                return value;
+            } else {
+                throw new Error(`File ${fileName} lost its integrity`);
+            }
+        }
+        return null;
+    }
 
     private async processReadStreamData(
         _fileStream: ReadStream,
