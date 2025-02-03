@@ -4,6 +4,7 @@ import { inject, injectable } from 'tsyringe';
 
 import { StorageBackend } from './storage-backend/storage-backend';
 import { StorageBackendToken } from '../ioc-tokens';
+import { computeChecksum } from './helpers';
 
 export interface FileStorage {
     /**
@@ -39,6 +40,8 @@ export interface FileStorage {
 
 @injectable()
 export class AppFileStorage implements FileStorage {
+    uploadedfileKey: string[] = [];
+    genericStrFileClassifier: string = '%str%';
     constructor(@inject(StorageBackendToken) private backend: StorageBackend) {
         console.log('TODO: implement AppFileStorage', this.backend);
     }
@@ -48,7 +51,22 @@ export class AppFileStorage implements FileStorage {
         _fileName: string,
         _chunkSize: number,
         _parallel: number
-    ): Promise<void> {}
+    ): Promise<void> {
+        // Add file content to buffer
+        // Todo: check for duplicate files and decide what to do
+        try {
+            if (_fileStream instanceof ReadStream) {
+                await this.processReadStreamData(_fileStream, _chunkSize, _fileName, _parallel);
+            } else {
+                await this.processStreamChunks(_fileStream, _chunkSize, _fileName, _parallel);
+            }
+        } catch (error) {
+            console.error('Error processing file stream:', error);
+            throw error;
+        }
+
+        this.uploadedfileKey.push(_fileName);
+    }
 
     public async downloadFile(fileName: string, _parallel: number): Promise<Buffer> {
         throw new Error(`File ${fileName} not found`);
@@ -56,5 +74,123 @@ export class AppFileStorage implements FileStorage {
 
     public async listUploadedFiles(): Promise<string[]> {
         return [];
+    }
+
+
+    private async processReadStreamData(
+        _fileStream: ReadStream,
+        _chunkSize: number,
+        _fileName: string,
+        _parallel: number
+    ) {
+        let counter = 0;
+        let state = { buffer: Buffer.alloc(0), size: 0, text: '' };
+        let calls: Promise<any>[] = [];
+        _parallel = _parallel < 1 ? 1 : _parallel;
+
+        _fileStream.on('data', async (chunk) => {
+            switch (typeof chunk) {
+                case 'string':
+                    const byteLength = Buffer.byteLength(chunk, 'utf8');
+                    state.size += byteLength;
+                    state.text += chunk;
+                    if (state.size === _chunkSize) {
+                        const promise = new Promise((resolve, reject) => {
+                            this.backend
+                                .set(`${_fileName}-${counter}-str`, state.text)
+                                .then(() => resolve('done'))
+                                .catch(reject);
+                        });
+                        calls.push(promise);
+                    }
+                    break;
+                case 'object':
+                    if (Buffer.isBuffer(chunk)) {
+                        state.size += chunk.length;
+                        state.buffer = Buffer.concat([state.buffer, chunk]);
+                        if (state.size === _chunkSize) {
+                            let checksum = computeChecksum(chunk);
+                            const promise = new Promise((resolve, reject) => {
+                                this.backend
+                                    .set(`${_fileName}-${counter}-b${checksum}`, state.buffer)
+                                    .then(() => resolve('done'))
+                                    .catch(reject);
+                            });
+                            calls.push(promise);
+                        }
+                    }
+                    break;
+            }
+
+            if (calls.length == _parallel) {
+                let pendingCalls = [...calls];
+                calls.length = 0;
+                await Promise.all(pendingCalls);
+            }
+
+            if (state.size == _chunkSize) {
+                state = { buffer: Buffer.alloc(0), size: 0, text: '' };
+                counter += 1;
+            }
+        });
+        _fileStream.on('end', async () => {
+            if (calls.length > 0) {
+                let pendingCalls = [...calls];
+                calls.length = 0;
+                await Promise.all(pendingCalls);
+            }
+            _fileStream.close();
+        });
+    }
+
+    async processStreamChunks(
+        _fileStream: ReadableStream<Uint8Array>,
+        _chunkSize: number,
+        _fileName: string,
+        _parallel: number
+    ) {
+        const reader = _fileStream.getReader();
+        const calls: Promise<any>[] = [];
+        _parallel = Math.max(1, _parallel);
+        const state = { buffer: Buffer.alloc(0), size: 0, count: 0 };
+        while (true) {
+            const { value: chunk, done } = await reader.read();
+            if (done) break;
+
+            console.log(`Calling stream at index ${state.count}`);
+            const buffer = chunk as Buffer;
+            state.buffer = Buffer.concat([state.buffer, buffer]);
+            state.size += buffer.length;
+
+            if (state.size >= _chunkSize) {
+                let checksum = computeChecksum(chunk);
+                const promise = new Promise((resolve, reject) => {
+                    this.backend
+                        .set(`${_fileName}-${state.count}-b${checksum}`, state.buffer)
+                        .then(() => resolve('done'))
+                        .catch(reject);
+                });
+                calls.push(promise);
+                // Reset for next chunk
+                state.buffer = Buffer.alloc(0);
+                state.size = 0;
+                state.count++;
+            }
+
+            if (calls.length == _parallel) {
+                console.log(`Saving to storage`);
+                let pendingCalls = [...calls];
+                calls.length = 0;
+                await Promise.all(pendingCalls);
+            }
+        }
+
+        // Save any remaining buffer
+        if (state.buffer.length > 0) {
+            let checksum = computeChecksum(state.buffer);
+            this.backend.set(`${_fileName}-${state.count}-b${checksum}`, state.buffer);
+        }
+
+        console.log(`Upload completed`);
     }
 }
