@@ -142,7 +142,7 @@ export class AppFileStorage implements FileStorage {
                 return value;
             } else {
                 console.log(`File ${fileName}: ${key.split('.')[0]} lost its integrity`);
-                return value;
+                return null;
             }
         }
         return null;
@@ -234,10 +234,12 @@ export class AppFileStorage implements FileStorage {
             state.size += buffer.length;
 
             if (state.size >= _chunkSize) {
-                let checksum = computeChecksum(chunk);
+                let checksum = computeChecksum(state.buffer);
+                let keyName = `${_fileName}-${state.count}-${checksum}`;
+
                 const promise = new Promise((resolve, reject) => {
                     this.backend
-                        .set(`${_fileName}-${state.count}-b${checksum}`, state.buffer)
+                        .set(keyName, state.buffer)
                         .then(() => resolve('done'))
                         .catch(reject);
                 });
@@ -258,7 +260,7 @@ export class AppFileStorage implements FileStorage {
         // Save any remaining buffer
         if (state.buffer.length > 0) {
             let checksum = computeChecksum(state.buffer);
-            this.backend.set(`${_fileName}-${state.count}-b${checksum}`, state.buffer);
+            this.backend.set(`${_fileName}-${state.count}-${checksum}`, state.buffer);
         }
 
         console.log(`Upload completed`);
