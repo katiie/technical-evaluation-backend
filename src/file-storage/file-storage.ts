@@ -1,5 +1,5 @@
 import { ReadStream } from 'node:fs';
-import type { ReadableStream } from 'node:stream/web';
+import { ReadableStream } from 'node:stream/web';
 import { inject, injectable } from 'tsyringe';
 import pLimit from 'p-limit';
 
@@ -41,11 +41,9 @@ export interface FileStorage {
 
 @injectable()
 export class AppFileStorage implements FileStorage {
-    uploadedfileKey: string[] = [];
-    genericStrFileClassifier: string = '%str%';
-    constructor(@inject(StorageBackendToken) private backend: StorageBackend) {
-        console.log('TODO: implement AppFileStorage', this.backend);
-    }
+    private uploadedFilesKey = 'UploadedFiles';
+
+    constructor(@inject(StorageBackendToken) private backend: StorageBackend) {}
 
     public async uploadFile(
         _fileStream: ReadableStream<Uint8Array> | ReadStream,
@@ -53,46 +51,47 @@ export class AppFileStorage implements FileStorage {
         _chunkSize: number,
         _parallel: number
     ): Promise<void> {
-        // Add file content to buffer
-        // Todo: check for duplicate files and decide what to do
         try {
-            if (_fileStream instanceof ReadStream) {
-                await this.processReadStreamData(_fileStream, _chunkSize, _fileName, _parallel);
-            } else {
-                await this.processStreamChunks(_fileStream, _chunkSize, _fileName, _parallel);
-            }
+            const readableStream =
+                _fileStream instanceof ReadStream
+                    ? new ReadableStream({
+                          start(controller) {
+                              _fileStream.on('data', (chunk) =>
+                                  controller.enqueue(new Uint8Array(Buffer.from(chunk)))
+                              );
+                              _fileStream.on('end', () => controller.close());
+                              _fileStream.on('error', (error) => controller.error(error));
+                          },
+                      })
+                    : _fileStream;
+
+            await this.processStreamChunks(readableStream, _chunkSize, _fileName, _parallel);
         } catch (error) {
             console.error('Error processing file stream:', error);
             throw error;
         }
-
-        this.uploadedfileKey.push(_fileName);
     }
+    public async downloadFile(fileName: string, _parallel?: number): Promise<Buffer> {
+        _parallel = Math.max(1, _parallel ?? 1);
+        // Get file metadata
+        const fileMetaData = await this.backend.get(`${fileName}`);
+        if (!fileMetaData) {
+            throw new Error(`File ${fileName} not found`);
+        }
 
-    public async downloadFile(fileName: string, _parallel: number): Promise<Buffer> {
-        _parallel = _parallel < 1 ? 1 : _parallel;
-        // Todo: introduce batch processing for download file using promise.all
-        let fileKeys = await this.backend.keys(`${fileName}*`);
+        const fileChunksKeys = new Map<string, string>(Object.entries(JSON.parse(fileMetaData)));
         try {
             let fileBuffer = Buffer.alloc(0);
-            if (fileKeys.length > 0) {
-                fileKeys.sort();
-                let isStr: boolean = fileKeys[0].includes(`${this.genericStrFileClassifier}}`);
-                let promises: Promise<Buffer>[] = [];
-                for (let key of fileKeys) {
-                    if (fileKeys.length < _parallel && _parallel > 1) {
-                        const promise = new Promise<Buffer>((resolve, reject) => {
-                            this.appendBufferFromFileKey(key, isStr, fileName)
-                                .then((data) => (data ? resolve(data) : null))
-                                .catch(reject);
-                        });
-                        promises.push(promise);
-                    } else {
-                        let bufferValue = await this.appendBufferFromFileKey(key, isStr, fileName);
-                        if (bufferValue != null) {
-                            fileBuffer = Buffer.concat([fileBuffer, bufferValue]);
-                        }
-                    }
+            if (fileChunksKeys.size > 0) {
+                const promises: Promise<Buffer>[] = [];
+
+                for (const [key, value] of fileChunksKeys) {
+                    const promise = new Promise<Buffer>((resolve, reject) => {
+                        this.appendBufferFromFileKey(key, value, fileName)
+                            .then((data) => (data ? resolve(data) : null))
+                            .catch(reject);
+                    });
+                    promises.push(promise);
                 }
 
                 // Usage
@@ -101,18 +100,22 @@ export class AppFileStorage implements FileStorage {
                         fileBuffer = Buffer.concat([fileBuffer, ...results]);
                     });
                 }
-                console.log(`Download completed`);
-                return fileBuffer;
             }
+
+            if (fileBuffer.length === 0) {
+                throw new Error(`Downloaded file ${fileName} is empty`);
+            }
+
+            console.log(`Download completed`);
+            return fileBuffer;
         } catch (error) {
             console.error('Error downloading file:', error);
             throw error;
         }
-        throw new Error(`File ${fileName} not found`);
     }
 
     public async listUploadedFiles(): Promise<string[]> {
-        return this.uploadedfileKey;
+        return await this.backend.getListAll(this.uploadedFilesKey);
     }
     async batchApiCallsWithLimit<Buffer>(
         methodCall: Promise<Buffer>[],
@@ -125,20 +128,13 @@ export class AppFileStorage implements FileStorage {
 
     private async appendBufferFromFileKey(
         key: string,
-        isStr: boolean,
+        savedChecksum: string,
         fileName: string
     ): Promise<Buffer | null> {
-        if (isStr) {
-            const value = await this.backend.get(key);
-            if (value != null) {
-                return Buffer.from(value);
-            }
-        }
-
         const value = await this.backend.getBuffer(key);
         if (value != null) {
-            let checksum = await this.backend.verifyChecksum(key);
-            if (key.includes(checksum)) {
+            const checksum = await this.backend.verifyChecksum(key);
+            if (checksum === savedChecksum) {
                 return value;
             } else {
                 console.log(`File ${fileName}: ${key.split('.')[0]} lost its integrity`);
@@ -148,74 +144,7 @@ export class AppFileStorage implements FileStorage {
         return null;
     }
 
-    private async processReadStreamData(
-        _fileStream: ReadStream,
-        _chunkSize: number,
-        _fileName: string,
-        _parallel: number
-    ) {
-        let counter = 0;
-        let state = { buffer: Buffer.alloc(0), size: 0, text: '' };
-        let calls: Promise<any>[] = [];
-        _parallel = _parallel < 1 ? 1 : _parallel;
-
-        _fileStream.on('data', async (chunk) => {
-            switch (typeof chunk) {
-                case 'string':
-                    const byteLength = Buffer.byteLength(chunk, 'utf8');
-                    state.size += byteLength;
-                    state.text += chunk;
-                    if (state.size === _chunkSize) {
-                        const promise = new Promise((resolve, reject) => {
-                            this.backend
-                                .set(`${_fileName}-${counter}-str`, state.text)
-                                .then(() => resolve('done'))
-                                .catch(reject);
-                        });
-                        calls.push(promise);
-                    }
-                    break;
-                case 'object':
-                    if (Buffer.isBuffer(chunk)) {
-                        state.size += chunk.length;
-                        state.buffer = Buffer.concat([state.buffer, chunk]);
-                        if (state.size === _chunkSize) {
-                            let checksum = computeChecksum(chunk);
-                            const promise = new Promise((resolve, reject) => {
-                                this.backend
-                                    .set(`${_fileName}-${counter}-b${checksum}`, state.buffer)
-                                    .then(() => resolve('done'))
-                                    .catch(reject);
-                            });
-                            calls.push(promise);
-                        }
-                    }
-                    break;
-            }
-
-            if (calls.length == _parallel) {
-                let pendingCalls = [...calls];
-                calls.length = 0;
-                await Promise.all(pendingCalls);
-            }
-
-            if (state.size == _chunkSize) {
-                state = { buffer: Buffer.alloc(0), size: 0, text: '' };
-                counter += 1;
-            }
-        });
-        _fileStream.on('end', async () => {
-            if (calls.length > 0) {
-                let pendingCalls = [...calls];
-                calls.length = 0;
-                await Promise.all(pendingCalls);
-            }
-            _fileStream.close();
-            console.log(`Upload completed`);
-        });
-    }
-
-    async processStreamChunks(
+    private async processStreamChunks(
         _fileStream: ReadableStream<Uint8Array>,
         _chunkSize: number,
         _fileName: string,
@@ -225,6 +154,8 @@ export class AppFileStorage implements FileStorage {
         const calls: Promise<any>[] = [];
         _parallel = Math.max(1, _parallel);
         const state = { buffer: Buffer.alloc(0), size: 0, count: 0 };
+        const filechunksDetail = new Map<string, string>();
+
         while (true) {
             const { value: chunk, done } = await reader.read();
             if (done) break;
@@ -234,8 +165,12 @@ export class AppFileStorage implements FileStorage {
             state.size += buffer.length;
 
             if (state.size >= _chunkSize) {
-                let checksum = computeChecksum(state.buffer);
-                let keyName = `${_fileName}-${state.count}-${checksum}`;
+                // Compute backend checksum
+                const checksum = computeChecksum(state.buffer);
+                const keyName = `${_fileName}-${state.count}`;
+
+                // Verify checksum
+                await this.confirmCheckSum(checksum, keyName);
 
                 const promise = new Promise((resolve, reject) => {
                     this.backend
@@ -244,6 +179,8 @@ export class AppFileStorage implements FileStorage {
                         .catch(reject);
                 });
                 calls.push(promise);
+                filechunksDetail.set(keyName, checksum);
+
                 // Reset for next chunk
                 state.buffer = Buffer.alloc(0);
                 state.size = 0;
@@ -251,7 +188,7 @@ export class AppFileStorage implements FileStorage {
             }
 
             if (calls.length == _parallel) {
-                let pendingCalls = [...calls];
+                const pendingCalls = [...calls];
                 calls.length = 0;
                 await Promise.all(pendingCalls);
             }
@@ -259,10 +196,29 @@ export class AppFileStorage implements FileStorage {
 
         // Save any remaining buffer
         if (state.buffer.length > 0) {
-            let checksum = computeChecksum(state.buffer);
-            this.backend.set(`${_fileName}-${state.count}-${checksum}`, state.buffer);
+            const keyName = `${_fileName}-${state.count}`;
+            const checksum = computeChecksum(state.buffer);
+            this.backend.set(keyName, state.buffer);
+            filechunksDetail.set(keyName, checksum);
+
+            // Verify checksum
+            await this.confirmCheckSum(checksum, keyName);
         }
 
+        // Save File metadata and Uploaded file names
+        await Promise.all([
+            this.backend.set(_fileName, JSON.stringify(Object.fromEntries(filechunksDetail))),
+            this.backend.rPush(this.uploadedFilesKey, _fileName),
+        ]);
+        await new Promise((resolve) => setTimeout(resolve, 0));
         console.log(`Upload completed`);
+    }
+
+    public async confirmCheckSum(savedChecksum: string, keyName: string) {
+        // Verify checksum
+        if ((await this.backend.verifyChecksum(keyName)) !== savedChecksum) {
+            // an exception can be throw
+            console.log('Invalid checksum');
+        }
     }
 }
